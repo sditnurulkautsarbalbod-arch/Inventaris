@@ -123,8 +123,10 @@
                 return await request('delete', { type, id });
             },
             
-            requestDelete: async (type, id) => {
-                return await request('update', { type, data: { id, deleteRequested: true } });
+            requestDelete: async (type, data) => {
+                // We pass the full data object (or partial) to ensure specific fields (like 'jamPelajaran') 
+                // can be enforced as strings during the update process.
+                return await request('update', { type, data: { ...data, deleteRequested: true } });
             }
         };
 
@@ -197,6 +199,7 @@
         const formatDate = (dateStr) => {
             if (!dateStr) return '-';
             const date = new Date(dateStr);
+            if (isNaN(date.getTime())) return dateStr; // Fallback if invalid date
             return new Intl.DateTimeFormat('id-ID').format(date);
         };
 
@@ -204,6 +207,27 @@
             if (!value) return 'Rp. 0';
             const clean = String(value).replace(/\D/g, '');
             return 'Rp. ' + clean.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+        };
+
+        // Formatter khusus untuk Jam di Admin Panel
+        const formatJam = (val) => {
+            if (!val) return '-';
+            const strVal = String(val);
+            // Jika formatnya terlihat seperti ISO Date (e.g. 2025-05-03T...), coba format ulang atau return as is
+            if (strVal.match(/^\d{4}-\d{2}-\d{2}T/)) {
+                return formatDate(strVal); // Tampilkan sebagai tanggal pendek jika terlanjur error
+            }
+            return strVal;
+        };
+
+        // Helper for numeric sorting of Laptop units (Laptop 1 < Laptop 10)
+        const sortLaptopUnits = (a, b) => {
+            const getNum = (str) => {
+                if (!str) return 0;
+                const match = str.match(/(\d+)/);
+                return match ? parseInt(match[0], 10) : 0;
+            };
+            return getNum(a.laptopKe) - getNum(b.laptopKe);
         };
 
         const App = () => {
@@ -257,12 +281,7 @@
                 e.preventDefault();
                 setIsLoading(true);
                 
-                // Tambahkan koma atas (') untuk memaksa format teks di Google Sheet
-                const payload = {
-                    ...lcdForm,
-                    jamPelajaran: `'${lcdForm.jamPelajaran}`
-                };
-
+                const payload = { ...lcdForm, jamPelajaran: `'${lcdForm.jamPelajaran}` };
                 await SheetService.create('lcd', payload);
                 setLcdForm({ jenis: 'LCD', tanggal: '', kelas: '', jamPelajaran: '' });
                 await fetchData();
@@ -271,6 +290,7 @@
             const handleLaptopSubmit = async (e) => {
                 e.preventDefault();
                 setIsLoading(true);
+                
                 await SheetService.create('laptop', laptopForm);
                 setLaptopForm({ laptopKe: '', tanggal: '', guru: '' });
                 await fetchData();
@@ -279,6 +299,7 @@
             const handlePengajuanSubmit = async (e) => {
                 e.preventDefault();
                 setIsLoading(true);
+                
                 await SheetService.create('pengajuan', { ...pengajuanForm, status: 'Tidak Ada' });
                 setPengajuanForm({ mapel: '', jumlah: '', kelas: '', namaSiswa: '' });
                 await fetchData();
@@ -288,7 +309,26 @@
             const handleDeleteRequest = async () => {
                 if (!deleteConfirm) return;
                 setIsLoading(true);
-                await SheetService.requestDelete(deleteConfirm.type, deleteConfirm.id);
+                
+                const { type, id } = deleteConfirm;
+                let payload = { id };
+
+                // FIX: Ensure jamPelajaran is treated as string during delete request update
+                if (type === 'lcd') {
+                    const item = data.lcd.find(x => x.id === id);
+                    if (item) {
+                        // If it's not already an ISO date string, ensure apostrophe
+                        const currentJam = item.jamPelajaran;
+                        if (currentJam && !String(currentJam).startsWith("'") && !String(currentJam).match(/^\d{4}-/)) {
+                            payload.jamPelajaran = `'${currentJam}`;
+                        } else {
+                            // If it's already corrupted or fine, pass as is but this helps prevent auto-conversion of "4-5"
+                            payload.jamPelajaran = currentJam;
+                        }
+                    }
+                }
+
+                await SheetService.requestDelete(type, payload);
                 setDeleteConfirm(null);
                 await fetchData();
             };
@@ -298,13 +338,15 @@
                 if (!editModal) return;
                 setIsLoading(true);
                 
-                let dataToSave = editModal.data;
+                const { type, data: editedData } = editModal;
+                
                 // Preserve apostrophe for LCD Jam
-                if (editModal.type === 'lcd' && !dataToSave.jamPelajaran.startsWith("'")) {
+                let dataToSave = editedData;
+                if (type === 'lcd' && !dataToSave.jamPelajaran.startsWith("'")) {
                     dataToSave = { ...dataToSave, jamPelajaran: `'${dataToSave.jamPelajaran}` };
                 }
 
-                await SheetService.update(editModal.type, dataToSave);
+                await SheetService.update(type, dataToSave);
                 setEditModal(null);
                 await fetchData();
             };
@@ -375,7 +417,7 @@
                             { header: 'Jenis', accessor: (item) => <span className={`px-2 py-1 rounded text-xs font-bold ${item.jenis === 'LCD' ? 'bg-blue-100 text-blue-800' : 'bg-purple-100 text-purple-800'}`}>{item.jenis}</span> },
                             { header: 'Tanggal', accessor: (item) => formatDate(item.tanggal) },
                             { header: 'Kelas', accessor: (item) => item.kelas },
-                            { header: 'Jam', accessor: (item) => item.jamPelajaran },
+                            { header: 'Jam', accessor: (item) => formatJam(item.jamPelajaran) },
                         ]}
                         actions={(item) => (
                             <div className="flex justify-end gap-2">
@@ -387,58 +429,64 @@
                 </div>
             );
 
-            const renderLaptopTab = () => (
-                <div className="space-y-6">
-                    <div className="bg-white p-4 md:p-6 rounded-lg shadow-sm border border-gray-200">
-                        <h3 className="text-lg font-bold text-gray-800 mb-4">Tambah Data Laptop</h3>
-                        <form onSubmit={handleLaptopSubmit} className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                            <select 
-                                className="border p-2 rounded w-full text-sm" 
-                                required
-                                value={laptopForm.laptopKe}
-                                onChange={e => setLaptopForm({...laptopForm, laptopKe: e.target.value})}
-                            >
-                                <option value="">Pilih Laptop</option>
-                                {[...Array(10)].map((_, i) => <option key={i} value={`Laptop ${i+1}`}>Laptop {i+1}</option>)}
-                            </select>
-                            <input 
-                                type="date" 
-                                className="border p-2 rounded w-full text-sm" 
-                                required
-                                value={laptopForm.tanggal}
-                                onChange={e => setLaptopForm({...laptopForm, tanggal: e.target.value})}
-                            />
-                            <select 
-                                className="border p-2 rounded w-full text-sm" 
-                                required
-                                value={laptopForm.guru}
-                                onChange={e => setLaptopForm({...laptopForm, guru: e.target.value})}
-                            >
-                                <option value="">Pilih Guru</option>
-                                {GURU_LIST.map(g => <option key={g} value={g}>{g}</option>)}
-                            </select>
-                            <button disabled={isLoading} className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 disabled:bg-indigo-300 w-full text-sm font-medium">
-                                {isLoading ? '...' : 'Tambah'}
-                            </button>
-                        </form>
-                    </div>
+            const renderLaptopTab = () => {
+                const sortedLaptopData = [...data.laptop]
+                    .filter(x => !x.deleteRequested)
+                    .sort(sortLaptopUnits);
 
-                    <Table
-                        data={data.laptop.filter(x => !x.deleteRequested)}
-                        columns={[
-                            { header: 'Unit', accessor: (item) => item.laptopKe },
-                            { header: 'Tanggal', accessor: (item) => formatDate(item.tanggal) },
-                            { header: 'Peminjam', accessor: (item) => item.guru },
-                        ]}
-                        actions={(item) => (
-                            <div className="flex justify-end gap-2">
-                                <button onClick={() => setEditModal({ open: true, type: 'laptop', data: { ...item } })} className="text-blue-600 hover:underline text-xs md:text-sm">Edit</button>
-                                <button onClick={() => setDeleteConfirm({ open: true, type: 'laptop', id: item.id })} className="text-red-600 hover:underline text-xs md:text-sm">Hapus</button>
-                            </div>
-                        )}
-                    />
-                </div>
-            );
+                return (
+                    <div className="space-y-6">
+                        <div className="bg-white p-4 md:p-6 rounded-lg shadow-sm border border-gray-200">
+                            <h3 className="text-lg font-bold text-gray-800 mb-4">Tambah Data Laptop</h3>
+                            <form onSubmit={handleLaptopSubmit} className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                <select 
+                                    className="border p-2 rounded w-full text-sm" 
+                                    required
+                                    value={laptopForm.laptopKe}
+                                    onChange={e => setLaptopForm({...laptopForm, laptopKe: e.target.value})}
+                                >
+                                    <option value="">Pilih Laptop</option>
+                                    {[...Array(10)].map((_, i) => <option key={i} value={`Laptop ${i+1}`}>Laptop {i+1}</option>)}
+                                </select>
+                                <input 
+                                    type="date" 
+                                    className="border p-2 rounded w-full text-sm" 
+                                    required
+                                    value={laptopForm.tanggal}
+                                    onChange={e => setLaptopForm({...laptopForm, tanggal: e.target.value})}
+                                />
+                                <select 
+                                    className="border p-2 rounded w-full text-sm" 
+                                    required
+                                    value={laptopForm.guru}
+                                    onChange={e => setLaptopForm({...laptopForm, guru: e.target.value})}
+                                >
+                                    <option value="">Pilih Guru</option>
+                                    {GURU_LIST.map(g => <option key={g} value={g}>{g}</option>)}
+                                </select>
+                                <button disabled={isLoading} className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 disabled:bg-indigo-300 w-full text-sm font-medium">
+                                    {isLoading ? '...' : 'Tambah'}
+                                </button>
+                            </form>
+                        </div>
+
+                        <Table
+                            data={sortedLaptopData}
+                            columns={[
+                                { header: 'Unit', accessor: (item) => item.laptopKe },
+                                { header: 'Tanggal', accessor: (item) => formatDate(item.tanggal) },
+                                { header: 'Peminjam', accessor: (item) => item.guru },
+                            ]}
+                            actions={(item) => (
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setEditModal({ open: true, type: 'laptop', data: { ...item } })} className="text-blue-600 hover:underline text-xs md:text-sm">Edit</button>
+                                    <button onClick={() => setDeleteConfirm({ open: true, type: 'laptop', id: item.id })} className="text-red-600 hover:underline text-xs md:text-sm">Hapus</button>
+                                </div>
+                            )}
+                        />
+                    </div>
+                );
+            }
 
             const renderBukuTab = () => {
                 const renderMatrixTable = (title, tableData, type) => (
@@ -517,7 +565,7 @@
                                     value={pengajuanForm.namaSiswa} onChange={e => setPengajuanForm({...pengajuanForm, namaSiswa: e.target.value})}
                                 />
                                 <button disabled={isLoading} className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 disabled:bg-indigo-300 w-full text-sm font-medium">
-                                    Ajukan
+                                    {isLoading ? '...' : 'Ajukan'}
                                 </button>
                             </form>
                             
@@ -552,8 +600,16 @@
 
             const renderAdminPanel = () => {
                 const deletions = [
-                    ...data.lcd.filter(x => x.deleteRequested).map(x => ({...x, _type: 'lcd', _desc: `LCD: ${x.jenis} - ${x.tanggal}`})),
-                    ...data.laptop.filter(x => x.deleteRequested).map(x => ({...x, _type: 'laptop', _desc: `Laptop: ${x.laptopKe} - ${x.guru}`})),
+                    ...data.lcd.filter(x => x.deleteRequested).map(x => ({
+                        ...x, 
+                        _type: 'lcd', 
+                        _desc: `LCD: ${x.jenis} - ${formatDate(x.tanggal)} - ${formatJam(x.jamPelajaran)}`
+                    })),
+                    ...data.laptop.filter(x => x.deleteRequested).map(x => ({
+                        ...x, 
+                        _type: 'laptop', 
+                        _desc: `Laptop: ${x.laptopKe} - ${formatDate(x.tanggal)}`
+                    })),
                     ...data.pengajuan.filter(x => x.deleteRequested).map(x => ({...x, _type: 'pengajuan', _desc: `Pengajuan: ${x.mapel} - ${x.namaSiswa}`})),
                     ...data.bukuSisa.filter(x => x.deleteRequested).map(x => ({...x, _type: 'bukuSisa', _desc: `Sisa Buku: ${x.mapel}`})),
                     ...data.bukuHarga.filter(x => x.deleteRequested).map(x => ({...x, _type: 'bukuHarga', _desc: `Harga Buku: ${x.mapel}`})),
@@ -574,7 +630,17 @@
                                                 <button 
                                                     onClick={async () => {
                                                         setIsLoading(true);
-                                                        await SheetService.update(item._type, { id: item.id, deleteRequested: false });
+                                                        let payload = { id: item.id, deleteRequested: false };
+                                                        if (item._type === 'lcd') {
+                                                            const currentJam = item.jamPelajaran;
+                                                            // Check if it needs apostrophe AND is NOT an ISO date string
+                                                            // If it's ALREADY an ISO string, don't add apostrophe, just send as is or try to sanitize?
+                                                            // Sending it back as is avoids making it "'2025..."
+                                                            if (currentJam && !String(currentJam).startsWith("'") && !String(currentJam).match(/^\d{4}-/)) {
+                                                                payload.jamPelajaran = `'${currentJam}`;
+                                                            }
+                                                        }
+                                                        await SheetService.update(item._type, payload);
                                                         await fetchData();
                                                     }}
                                                     className="text-xs bg-gray-200 px-2 py-1 rounded hover:bg-gray-300"
