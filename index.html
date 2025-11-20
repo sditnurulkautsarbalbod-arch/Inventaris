@@ -390,7 +390,7 @@
             const renderLaptopTab = () => (
                 <div className="space-y-6">
                     <div className="bg-white p-4 md:p-6 rounded-lg shadow-sm border border-gray-200">
-                        <h3 className="text-lg font-bold text-gray-800 mb-4">Tambah Data Pengguna Laptop</h3>
+                        <h3 className="text-lg font-bold text-gray-800 mb-4">Tambah Data Laptop</h3>
                         <form onSubmit={handleLaptopSubmit} className="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <select 
                                 className="border p-2 rounded w-full text-sm" 
@@ -520,6 +520,11 @@
                                     Ajukan
                                 </button>
                             </form>
+                            
+                            {/* Catatan Pengajuan Buku */}
+                            <div className="mt-4 text-xs md:text-sm text-gray-600 italic bg-gray-50 p-3 rounded border border-gray-100">
+                                <span className="font-bold text-gray-700">Catatan:</span> Silakan ajukan buku apabila stok buku tidak ada atau habis di daftar sisa buku, admin akan menyediakan buku sesegera mungkin, silakan menunggu dan tetap pantau untuk melihat status buku menjadi "ada".
+                            </div>
                         </div>
 
                         <div className="mt-4">
