@@ -11,11 +11,11 @@
     <!-- Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     
-    <!-- React & ReactDOM (Development UMD) -->
+    <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     
-    <!-- Babel Standalone -->
+    <!-- Babel -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
     <style>
@@ -85,7 +85,7 @@
                 });
             },
 
-            // --- CRUD Operations (Local Only + Queue) ---
+            // --- CRUD Operations ---
 
             getAll: async () => {
                 const db = await LocalDB.open();
@@ -95,21 +95,17 @@
                 await Promise.all(STORES.map(storeName => new Promise(resolve => {
                     tx.objectStore(storeName).getAll().onsuccess = (e) => {
                         let items = e.target.result || [];
-                        
-                        // FIX: Sort items by _sortIndex to match Google Sheet order
-                        // Items without _sortIndex (newly added locally) go to the bottom
+                        // Sort by _sortIndex (Server Order)
                         items.sort((a, b) => {
                             const indexA = a._sortIndex !== undefined ? a._sortIndex : 999999;
                             const indexB = b._sortIndex !== undefined ? b._sortIndex : 999999;
                             return indexA - indexB;
                         });
-
                         result[storeName] = items;
                         resolve();
                     };
                 })));
                 
-                // Get Queue count for UI
                 return new Promise(resolve => {
                     tx.objectStore('syncQueue').count().onsuccess = (e) => {
                         result.queueCount = e.target.result;
@@ -118,10 +114,8 @@
                 });
             },
 
-            // Create: Add to store & Queue
             add: async (storeName, data) => {
                 const db = await LocalDB.open();
-                // New items don't have _sortIndex initially, so they will appear at bottom
                 const newItem = { ...data, id: data.id || crypto.randomUUID(), _synced: false };
                 const tx = db.transaction([storeName, 'syncQueue'], 'readwrite');
                 
@@ -130,13 +124,13 @@
                     action: 'create',
                     type: storeName,
                     payload: newItem,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    failures: 0 // Track failures
                 });
 
                 return new Promise(resolve => tx.oncomplete = () => resolve(newItem));
             },
 
-            // Update: Update store & Queue
             put: async (storeName, data) => {
                 const db = await LocalDB.open();
                 const tx = db.transaction([storeName, 'syncQueue'], 'readwrite');
@@ -146,13 +140,13 @@
                     action: 'update',
                     type: storeName,
                     payload: data,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    failures: 0
                 });
 
                 return new Promise(resolve => tx.oncomplete = () => resolve(data));
             },
 
-            // Delete: Remove from store & Queue
             delete: async (storeName, id) => {
                 const db = await LocalDB.open();
                 const tx = db.transaction([storeName, 'syncQueue'], 'readwrite');
@@ -162,18 +156,16 @@
                     action: 'delete',
                     type: storeName,
                     id: id,
-                    timestamp: Date.now()
+                    timestamp: Date.now(),
+                    failures: 0
                 });
 
                 return new Promise(resolve => tx.oncomplete = () => resolve(true));
             },
 
-            // Bulk Save (From Server to Local)
             mergeServerData: async (serverData) => {
                 const db = await LocalDB.open();
                 const tx = db.transaction([...STORES, 'syncQueue'], 'readwrite');
-                
-                // 1. Get all pending IDs from Queue
                 const queueRequest = tx.objectStore('syncQueue').getAll();
                 
                 return new Promise(resolve => {
@@ -184,13 +176,9 @@
                         STORES.forEach(storeName => {
                             if (serverData[storeName]) {
                                 const store = tx.objectStore(storeName);
-                                
-                                // Strategy: Clear Store then Re-add with Order
                                 store.clear().onsuccess = () => {
-                                    // Add Server Data with Index
                                     serverData[storeName].forEach((item, index) => {
                                         if (!pendingIds.has(item.id)) {
-                                            // FIX: Inject _sortIndex based on server array order
                                             item._sortIndex = index;
                                             store.put(item);
                                         }
@@ -216,18 +204,57 @@
                 const tx = db.transaction('syncQueue', 'readwrite');
                 tx.objectStore('syncQueue').delete(queueId);
                 return new Promise(resolve => tx.oncomplete = () => resolve());
+            },
+
+            // New: Increment failure count or delete if too many failures
+            markFailure: async (queueId, currentFailures) => {
+                const db = await LocalDB.open();
+                const tx = db.transaction('syncQueue', 'readwrite');
+                const store = tx.objectStore('syncQueue');
+                
+                if (currentFailures >= 3) {
+                    // Too many failures, delete item to unblock queue
+                    console.error(`Item ${queueId} failed 3 times. Removing from queue.`);
+                    store.delete(queueId);
+                } else {
+                    // Get item and increment failure
+                    store.get(queueId).onsuccess = (e) => {
+                        const item = e.target.result;
+                        if (item) {
+                            item.failures = (item.failures || 0) + 1;
+                            store.put(item);
+                        }
+                    };
+                }
+                return new Promise(resolve => tx.oncomplete = () => resolve());
+            },
+
+            clearQueue: async () => {
+                const db = await LocalDB.open();
+                const tx = db.transaction('syncQueue', 'readwrite');
+                tx.objectStore('syncQueue').clear();
+                return new Promise(resolve => tx.oncomplete = () => resolve());
             }
         };
 
-        // --- API SERVICE (Raw) ---
+        // --- API SERVICE (Improved) ---
         const apiRequest = async (action, payload) => {
             try {
                 const response = await fetch(API_URL, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'text/plain' },
+                    redirect: 'follow', // Penting untuk GAS
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // Penting untuk menghindari preflight CORS yg rumit
                     body: JSON.stringify({ action, ...payload }),
                 });
-                return await response.json();
+                
+                // Baca sebagai text dulu untuk debugging jika bukan JSON
+                const text = await response.text();
+                try {
+                    return JSON.parse(text);
+                } catch (e) {
+                    console.error("Server Responded with non-JSON:", text);
+                    throw new Error("Respon server tidak valid (Mungkin HTML error page)");
+                }
             } catch (error) {
                 console.error("API Network Error:", error);
                 throw error;
@@ -240,7 +267,6 @@
             
             processQueue: async (onQueueChange) => {
                 if (SyncService.isSyncing) return;
-                
                 if (!navigator.onLine) return;
 
                 const queue = await LocalDB.getQueue();
@@ -251,28 +277,38 @@
 
                 try {
                     const item = queue[0];
-                    console.log("Syncing item:", item);
+                    console.log(`Syncing item [${item.failures || 0} fails]:`, item);
 
                     let result;
-                    if (item.action === 'create') {
-                        result = await apiRequest('create', { type: item.type, data: item.payload });
-                    } else if (item.action === 'update') {
-                        result = await apiRequest('update', { type: item.type, data: item.payload });
-                    } else if (item.action === 'delete') {
-                        result = await apiRequest('delete', { type: item.type, id: item.id });
+                    try {
+                        if (item.action === 'create') {
+                            result = await apiRequest('create', { type: item.type, data: item.payload });
+                        } else if (item.action === 'update') {
+                            result = await apiRequest('update', { type: item.type, data: item.payload });
+                        } else if (item.action === 'delete') {
+                            result = await apiRequest('delete', { type: item.type, id: item.id });
+                        }
+
+                        if (result && result.status === 'success') {
+                            // Sukses
+                            await LocalDB.shiftQueue(item.queueId);
+                        } else {
+                            // Gagal logic (Server menolak)
+                            console.warn("Server Logic Error:", result);
+                            await LocalDB.markFailure(item.queueId, item.failures || 0);
+                        }
+                    } catch (netError) {
+                        // Gagal jaringan/parsing
+                        console.error("Network/Parse Error:", netError);
+                        await LocalDB.markFailure(item.queueId, item.failures || 0);
                     }
 
-                    if (result && result.status === 'success') {
-                        await LocalDB.shiftQueue(item.queueId);
-                        SyncService.isSyncing = false;
-                        SyncService.processQueue(onQueueChange); 
-                    } else {
-                        console.warn("Server returned error, keeping in queue:", result);
-                        SyncService.isSyncing = false;
-                    }
+                    // Lanjut ke item berikutnya
+                    SyncService.isSyncing = false;
+                    SyncService.processQueue(onQueueChange); 
 
                 } catch (e) {
-                    console.error("Sync failed (likely offline):", e);
+                    console.error("Critical Sync Error:", e);
                     SyncService.isSyncing = false;
                 } finally {
                      const remaining = await LocalDB.getQueue();
@@ -355,23 +391,18 @@
             const [passwordInput, setPasswordInput] = React.useState("");
             const [passwordError, setPasswordError] = React.useState("");
             
-            // Data State
             const [data, setData] = React.useState({ lcd: [], laptop: [], pengajuan: [], bukuSisa: [], bukuHarga: [] });
             const [queueCount, setQueueCount] = React.useState(0);
             const [isOnline, setIsOnline] = React.useState(navigator.onLine);
 
-            // Pagination State
             const [bukuSisaPage, setBukuSisaPage] = React.useState(1);
             const [bukuHargaPage, setBukuHargaPage] = React.useState(1);
-
-            // Forms
             const [lcdForm, setLcdForm] = React.useState({ jenis: 'LCD', tanggal: '', kelas: '', jamPelajaran: '' });
             const [laptopForm, setLaptopForm] = React.useState({ laptopKe: '', tanggal: '', guru: '' });
             const [pengajuanForm, setPengajuanForm] = React.useState({ mapel: '', jumlah: '', kelas: '', namaSiswa: '' });
             const [editModal, setEditModal] = React.useState(null);
             const [deleteConfirm, setDeleteConfirm] = React.useState(null);
 
-            // --- REFRESH DATA ---
             const refreshLocalData = async () => {
                 const local = await LocalDB.getAll();
                 if (local) {
@@ -381,7 +412,6 @@
             };
 
             const runBackgroundSync = async () => {
-                // 1. Fetch Latest from Server
                 if (navigator.onLine) {
                     try {
                         const serverResult = await apiRequest('getAll');
@@ -389,29 +419,28 @@
                             await LocalDB.mergeServerData(serverResult.data);
                             await refreshLocalData();
                         }
-                    } catch (e) {
-                        console.log("Background fetch skipped (network error)");
-                    }
-                    // 2. Process Queue
+                    } catch (e) { console.log("Bg fetch err"); }
                     await SyncService.processQueue((count) => setQueueCount(count));
                 }
             };
 
+            // Force Clear Queue Handler
+            const handleClearQueue = async () => {
+                if (confirm("Yakin ingin menghapus antrean yang macet? Data yang belum tersinkron mungkin akan hilang dari server (tapi masih ada di lokal sampai refresh berikutnya).")) {
+                    await LocalDB.clearQueue();
+                    setQueueCount(0);
+                    alert("Antrean dibersihkan.");
+                }
+            };
+
             React.useEffect(() => {
-                // Initial Load
                 refreshLocalData();
                 runBackgroundSync();
-
-                // Periodic Sync (Every 10 seconds)
                 const interval = setInterval(runBackgroundSync, 10000);
-
-                // Online/Offline Listeners
                 const handleOnline = () => { setIsOnline(true); runBackgroundSync(); };
                 const handleOffline = () => setIsOnline(false);
-                
                 window.addEventListener('online', handleOnline);
                 window.addEventListener('offline', handleOffline);
-
                 return () => {
                     clearInterval(interval);
                     window.removeEventListener('online', handleOnline);
@@ -419,16 +448,13 @@
                 };
             }, []);
 
-            // --- OPTIMISTIC ACTIONS ---
-            // Aksi ini langsung update DB Lokal dan UI, lalu trigger sync background
-
             const handleLcdSubmit = async (e) => {
                 e.preventDefault();
                 const payload = { ...lcdForm, jamPelajaran: `'${lcdForm.jamPelajaran}` };
                 await LocalDB.add('lcd', payload);
                 setLcdForm({ jenis: 'LCD', tanggal: '', kelas: '', jamPelajaran: '' });
-                await refreshLocalData(); // UI update instant
-                SyncService.processQueue(setQueueCount); // Background sync trigger
+                await refreshLocalData();
+                SyncService.processQueue(setQueueCount);
             };
 
             const handleLaptopSubmit = async (e) => {
@@ -450,21 +476,14 @@
             const handleDeleteRequest = async () => {
                 if (!deleteConfirm) return;
                 const { type, id } = deleteConfirm;
-                
-                // Cari data existing untuk update flag deleteRequested
                 let item = data[type].find(x => x.id === id);
                 if (item) {
-                     // Cloning item & adding flag
                      let payload = { ...item, deleteRequested: true };
-                     // Fix apostrophe logic if needed
                      if (type === 'lcd' && payload.jamPelajaran && !String(payload.jamPelajaran).startsWith("'")) {
                          payload.jamPelajaran = `'${payload.jamPelajaran}`;
                      }
-                     
-                     // Use PUT (Update) not Delete, because it's just a request
                      await LocalDB.put(type, payload);
                 }
-
                 setDeleteConfirm(null);
                 await refreshLocalData();
                 SyncService.processQueue(setQueueCount);
@@ -474,12 +493,10 @@
                 e.preventDefault();
                 if (!editModal) return;
                 const { type, data: editedData } = editModal;
-                
                 let dataToSave = editedData;
                 if (type === 'lcd' && !String(dataToSave.jamPelajaran).startsWith("'")) {
                     dataToSave = { ...dataToSave, jamPelajaran: `'${dataToSave.jamPelajaran}` };
                 }
-
                 await LocalDB.put(type, dataToSave);
                 setEditModal(null);
                 await refreshLocalData();
@@ -498,7 +515,6 @@
                 } else if (actionType === 'approvePengajuan') {
                     await LocalDB.put('pengajuan', { ...item, status: 'Sudah Ada' });
                 }
-                
                 await refreshLocalData();
                 SyncService.processQueue(setQueueCount);
             };
@@ -514,7 +530,6 @@
                 }
             };
 
-            // Render Tab Helpers
             const renderLcdTab = () => (
                 <div className="space-y-6">
                     <div className="bg-white p-4 md:p-6 rounded-lg shadow-sm border border-gray-200">
@@ -522,10 +537,7 @@
                         <form onSubmit={handleLcdSubmit} className="grid grid-cols-1 md:grid-cols-5 gap-4">
                             <select className="border p-2 rounded w-full text-sm" value={lcdForm.jenis} onChange={e => setLcdForm({...lcdForm, jenis: e.target.value})}><option value="LCD">LCD</option><option value="PID">PID</option></select>
                             <input type="date" className="border p-2 rounded w-full text-sm" required value={lcdForm.tanggal} onChange={e => setLcdForm({...lcdForm, tanggal: e.target.value})}/>
-                            <select className="border p-2 rounded w-full text-sm" required value={lcdForm.kelas} onChange={e => setLcdForm({...lcdForm, kelas: e.target.value})}>
-                                <option value="">Pilih Kelas</option>
-                                {[...Array(6)].map((_, i) => ['A','B','C','D'].map(char => (<option key={`${i+1}${char}`} value={`${i+1} ${char}`}>{i+1} {char}</option>)))}
-                            </select>
+                            <select className="border p-2 rounded w-full text-sm" required value={lcdForm.kelas} onChange={e => setLcdForm({...lcdForm, kelas: e.target.value})}><option value="">Pilih Kelas</option>{[...Array(6)].map((_, i) => ['A','B','C','D'].map(char => <option key={`${i+1}${char}`} value={`${i+1} ${char}`}>{i+1} {char}</option>))}</select>
                             <input type="text" placeholder="Jam ke... (4-5)" className="border p-2 rounded w-full text-sm" required value={lcdForm.jamPelajaran} onChange={e => setLcdForm({...lcdForm, jamPelajaran: e.target.value})}/>
                             <button className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 w-full text-sm font-medium">Tambah</button>
                         </form>
@@ -555,15 +567,9 @@
                         <div className="bg-white p-4 md:p-6 rounded-lg shadow-sm border border-gray-200">
                             <h3 className="text-lg font-bold text-gray-800 mb-4">Tambah Data Laptop</h3>
                             <form onSubmit={handleLaptopSubmit} className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                                <select className="border p-2 rounded w-full text-sm" required value={laptopForm.laptopKe} onChange={e => setLaptopForm({...laptopForm, laptopKe: e.target.value})}>
-                                    <option value="">Pilih Laptop</option>
-                                    {[...Array(9)].map((_, i) => <option key={i} value={`Laptop ${i+1}`}>Laptop {i+1}</option>)}
-                                </select>
+                                <select className="border p-2 rounded w-full text-sm" required value={laptopForm.laptopKe} onChange={e => setLaptopForm({...laptopForm, laptopKe: e.target.value})}><option value="">Pilih Laptop</option>{[...Array(9)].map((_, i) => <option key={i} value={`Laptop ${i+1}`}>Laptop {i+1}</option>)}</select>
                                 <input type="date" className="border p-2 rounded w-full text-sm" required value={laptopForm.tanggal} onChange={e => setLaptopForm({...laptopForm, tanggal: e.target.value})}/>
-                                <select className="border p-2 rounded w-full text-sm" required value={laptopForm.guru} onChange={e => setLaptopForm({...laptopForm, guru: e.target.value})}>
-                                    <option value="">Pilih Guru</option>
-                                    {GURU_LIST.map(g => <option key={g} value={g}>{g}</option>)}
-                                </select>
+                                <select className="border p-2 rounded w-full text-sm" required value={laptopForm.guru} onChange={e => setLaptopForm({...laptopForm, guru: e.target.value})}><option value="">Pilih Guru</option>{GURU_LIST.map(g => <option key={g} value={g}>{g}</option>)}</select>
                                 <button className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 w-full text-sm font-medium">Tambah</button>
                             </form>
                         </div>
@@ -603,7 +609,6 @@
                                     await LocalDB.add(type, { mapel: 'Baru', k1: '', k2: '', k3: '', k4: '', k5: '', k6: '' });
                                     await refreshLocalData();
                                     SyncService.processQueue(setQueueCount);
-                                    // Jump to last page logic omitted for brevity/speed
                                 }}
                                 className="text-xs md:text-sm bg-green-600 text-white px-3 py-1 rounded hover:bg-green-700"
                             >+ Baris</button>
@@ -658,10 +663,7 @@
                             <form onSubmit={handlePengajuanSubmit} className="grid grid-cols-1 md:grid-cols-5 gap-4">
                                 <input type="text" placeholder="Mapel" className="border p-2 rounded w-full text-sm" required value={pengajuanForm.mapel} onChange={e => setPengajuanForm({...pengajuanForm, mapel: e.target.value})}/>
                                 <input type="number" placeholder="Jumlah" className="border p-2 rounded w-full text-sm" required value={pengajuanForm.jumlah} onChange={e => setPengajuanForm({...pengajuanForm, jumlah: e.target.value})}/>
-                                <select className="border p-2 rounded w-full text-sm" required value={pengajuanForm.kelas} onChange={e => setPengajuanForm({...pengajuanForm, kelas: e.target.value})}>
-                                    <option value="">Pilih Kelas</option>
-                                    {[...Array(6)].map((_, i) => ['A','B','C','D'].map(char => (<option key={`${i+1}${char}`} value={`${i+1} ${char}`}>{i+1} {char}</option>)))}
-                                </select>
+                                <select className="border p-2 rounded w-full text-sm" required value={pengajuanForm.kelas} onChange={e => setPengajuanForm({...pengajuanForm, kelas: e.target.value})}><option value="">Pilih Kelas</option>{[...Array(6)].map((_, i) => ['A','B','C','D'].map(char => (<option key={`${i+1}${char}`} value={`${i+1} ${char}`}>{i+1} {char}</option>)))}</select>
                                 <input type="text" placeholder="Nama Siswa" className="border p-2 rounded w-full text-sm" required value={pengajuanForm.namaSiswa} onChange={e => setPengajuanForm({...pengajuanForm, namaSiswa: e.target.value})}/>
                                 <button className="bg-indigo-600 text-white p-2 rounded hover:bg-indigo-700 w-full text-sm font-medium">Ajukan</button>
                             </form>
@@ -739,15 +741,14 @@
                 <div className="min-h-screen flex flex-col max-w-6xl mx-auto p-2 md:p-4">
                     <header className="bg-white rounded-xl shadow-sm p-4 md:p-6 mb-4 md:mb-6 flex flex-col md:flex-row items-center justify-between gap-4">
                         <div className="text-center md:text-left">
-                            <h1 className="text-xl md:text-2xl font-extrabold text-indigo-900">
-                                INVENTARIS SEKOLAH & MANAJEMEN BUKU
-                            </h1>
+                            <h1 className="text-xl md:text-2xl font-extrabold text-indigo-900">INVENTARIS SEKOLAH & MANAJEMEN BUKU</h1>
                             <div className="flex items-center gap-2 text-xs font-medium mt-1 justify-center md:justify-start">
                                 {isOnline ? <span className="text-green-600">● Online</span> : <span className="text-red-500">● Offline</span>}
                                 {queueCount > 0 ? (
-                                    <span className="text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full border border-yellow-200 animate-pulse">
-                                        ⏳ {queueCount} Antrean Sync
-                                    </span>
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full border border-yellow-200 animate-pulse">⏳ {queueCount} Antrean</span>
+                                        <button onClick={handleClearQueue} title="Hapus antrean macet" className="text-red-500 hover:text-red-700 bg-red-50 p-1 rounded"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
+                                    </div>
                                 ) : (
                                     <span className="text-gray-400">✓ Ter-sync</span>
                                 )}
